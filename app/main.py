@@ -8,6 +8,7 @@ from fastapi import FastAPI, Query
 from . import rollout
 from .db import init_db
 from .models import (
+    ConfigUpdateResponse,
     CreateRolloutRequest,
     DecisionResultRequest,
     EvaluateResponse,
@@ -15,6 +16,7 @@ from .models import (
     PauseRequest,
     ReplicaStatusRequest,
     RolloutView,
+    UpdateConfigRequest,
     WindowMetricsRequest,
 )
 
@@ -55,6 +57,11 @@ def list_rollouts(limit: int = Query(default=50, ge=1, le=200)) -> list[dict]:
 @app.get("/rollouts/{rollout_id}", response_model=RolloutView)
 def get_rollout(rollout_id: str) -> dict:
     return rollout.get_rollout(rollout_id)
+
+
+@app.put("/rollouts/{rollout_id}/config", response_model=ConfigUpdateResponse)
+def update_config(rollout_id: str, req: UpdateConfigRequest) -> dict:
+    return rollout.update_config(rollout_id, req)
 
 
 @app.post(

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS releases (
     max_replicas_per_batch INTEGER NOT NULL,
     min_stable_window_seconds INTEGER NOT NULL,
     error_rate_threshold REAL NOT NULL,
+    config_version INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     current_generation INTEGER NOT NULL DEFAULT 0,
     current_replicas INTEGER NOT NULL DEFAULT 0,
@@ -85,7 +86,32 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_rollout
     ON decisions(rollout_id, created_at);
+
+-- At most one row per rollout: the latest accepted config change queued
+-- behind an in-flight decision's execution result. Activated (and deleted)
+-- when that result is recorded.
+CREATE TABLE IF NOT EXISTS pending_configs (
+    rollout_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    error_rate_threshold REAL NOT NULL,
+    min_stable_window_seconds INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring pre-upgrade databases forward (idempotent).
+
+    Databases created before config versioning lack releases.config_version;
+    add it in place so existing rollouts and pending decisions keep working.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(releases)")}
+    if "config_version" not in columns:
+        conn.execute(
+            "ALTER TABLE releases "
+            "ADD COLUMN config_version INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def utcnow() -> str:
@@ -107,6 +133,7 @@ def init_db(db_path: str | None = None) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with _connect(path) as conn:
         conn.executescript(DDL)
+        _migrate(conn)
 
 
 def get_write_lock(db_path: str | None = None) -> threading.RLock:

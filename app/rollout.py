@@ -12,6 +12,14 @@ Guarantees:
 * Pause/hold decisions do not consume a generation: operators may keep
   observing the same generation and re-evaluate later. Promote, rollback and
   complete decisions do consume it (the generation advances on execution).
+* Config (error-rate threshold, minimum stable window) is versioned. Updates
+  carry the latest accepted version and are rejected when stale; concurrent
+  updates on the same version are serialised so exactly one is accepted.
+  With no decision pending execution a new config applies immediately; while
+  a promote awaits its execution result the change is queued as the pending
+  config (later accepted changes replace it) and activated when the result —
+  success or failure — is recorded. Config is frozen while a rollback is
+  pending execution and after the rollout reaches a terminal state.
 """
 from __future__ import annotations
 
@@ -34,6 +42,7 @@ from .models import (
     CreateRolloutRequest,
     DecisionResultRequest,
     ReplicaStatusRequest,
+    UpdateConfigRequest,
     WindowMetricsRequest,
 )
 
@@ -48,7 +57,24 @@ GENERATION_CONSUMING = {ACTION_PROMOTE, ACTION_ROLLBACK, ACTION_COMPLETE}
 # row -> view mapping
 # ---------------------------------------------------------------------------
 
-def rollout_view(row) -> dict:
+def _pending_config_row(conn, rollout_id: str):
+    return conn.execute(
+        "SELECT * FROM pending_configs WHERE rollout_id = ?", (rollout_id,)
+    ).fetchone()
+
+
+def _pending_config_view(row) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "version": row["version"],
+        "error_rate_threshold": row["error_rate_threshold"],
+        "min_stable_window_seconds": row["min_stable_window_seconds"],
+        "created_at": row["created_at"],
+    }
+
+
+def rollout_view(conn, row) -> dict:
     return {
         "id": row["id"],
         "service": row["service"],
@@ -57,6 +83,10 @@ def rollout_view(row) -> dict:
         "max_replicas_per_batch": row["max_replicas_per_batch"],
         "min_stable_window_seconds": row["min_stable_window_seconds"],
         "error_rate_threshold": row["error_rate_threshold"],
+        "config_version": row["config_version"],
+        "pending_config": _pending_config_view(
+            _pending_config_row(conn, row["id"])
+        ),
         "status": row["status"],
         "current_generation": row["current_generation"],
         "current_replicas": row["current_replicas"],
@@ -174,7 +204,7 @@ def create_rollout(req: CreateRolloutRequest) -> dict:
                 req.error_rate_threshold, now, now,
             ),
         )
-        return rollout_view(_get_rollout(conn, rollout_id))
+        return rollout_view(conn, _get_rollout(conn, rollout_id))
 
 
 def list_rollouts(limit: int = 50) -> list[dict]:
@@ -182,12 +212,12 @@ def list_rollouts(limit: int = 50) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM releases ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
-        return [rollout_view(r) for r in rows]
+        return [rollout_view(conn, r) for r in rows]
 
 
 def get_rollout(rollout_id: str) -> dict:
     with get_conn() as conn:
-        return rollout_view(_get_rollout(conn, rollout_id))
+        return rollout_view(conn, _get_rollout(conn, rollout_id))
 
 
 def list_decisions(rollout_id: str) -> list[dict]:
@@ -420,7 +450,7 @@ def evaluate(rollout_id: str) -> dict:
     """
     with write_tx() as conn:
         rollout = _get_rollout(conn, rollout_id)
-        view = rollout_view(rollout)
+        view = rollout_view(conn, rollout)
 
         if rollout["pending_decision_id"]:
             pending = conn.execute(
@@ -598,7 +628,7 @@ def _eval_response(conn, rollout_id: str, decision_id: str, message: str) -> dic
         "SELECT * FROM decisions WHERE id = ?", (decision_id,)
     ).fetchone()
     return {
-        "rollout": rollout_view(rollout),
+        "rollout": rollout_view(conn, rollout),
         "decision": decision_view(decision),
         "evaluated": True,
         "message": message,
@@ -608,6 +638,31 @@ def _eval_response(conn, rollout_id: str, decision_id: str, message: str) -> dic
 # ---------------------------------------------------------------------------
 # execution result callback
 # ---------------------------------------------------------------------------
+
+def _activate_pending_config(conn, rollout_id: str, now: str):
+    """Promote the queued config (if any) to effective for the next evaluation.
+
+    Called when a decision's execution result is recorded: the in-flight
+    decision is settled, so the latest accepted config change takes over.
+    """
+    row = _pending_config_row(conn, rollout_id)
+    if row is None:
+        return None
+    conn.execute(
+        """
+        UPDATE releases
+        SET error_rate_threshold = ?, min_stable_window_seconds = ?,
+            config_version = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (row["error_rate_threshold"], row["min_stable_window_seconds"],
+         row["version"], now, rollout_id),
+    )
+    conn.execute(
+        "DELETE FROM pending_configs WHERE rollout_id = ?", (rollout_id,)
+    )
+    return row
+
 
 def report_execution(
     rollout_id: str, decision_id: str, req: DecisionResultRequest
@@ -709,15 +764,146 @@ def report_execution(
                 (new_status, failure, now, rollout_id),
             )
 
+        # The in-flight decision is settled: any queued config change now
+        # becomes effective and drives the next evaluation.
+        activated = _activate_pending_config(conn, rollout_id, now)
+
         rollout = _get_rollout(conn, rollout_id)
         updated = conn.execute(
             "SELECT * FROM decisions WHERE id = ?", (decision_id,)
         ).fetchone()
+        message = f"execution result '{req.status}' recorded"
+        if activated is not None:
+            message += f"; pending config v{activated['version']} activated"
         return {
-            "rollout": rollout_view(rollout),
+            "rollout": rollout_view(conn, rollout),
             "decision": decision_view(updated),
             "evaluated": False,
-            "message": f"execution result '{req.status}' recorded",
+            "message": message,
+        }
+
+
+# ---------------------------------------------------------------------------
+# operator config changes (optimistic versioning)
+# ---------------------------------------------------------------------------
+
+def update_config(rollout_id: str, req: UpdateConfigRequest) -> dict:
+    """Accept or reject a config change for an in-flight rollout.
+
+    Rejected (409) when the rollout is terminal, when a rollback decision is
+    pending execution, or when ``base_version`` is stale — the write lock
+    serialises concurrent submissions so only the first one on a given
+    version is accepted. With no decision pending execution the new config
+    applies immediately; while a promote awaits its execution result the
+    change is queued as the pending config, replacing any earlier queued
+    change, and is activated when the result is recorded.
+    """
+    with write_tx() as conn:
+        rollout = _get_rollout(conn, rollout_id)
+        if rollout["status"] in TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"rollout is terminal ({rollout['status']}); "
+                    "config can no longer be changed"
+                ),
+            )
+
+        pending_decision = None
+        if rollout["pending_decision_id"]:
+            pending_decision = conn.execute(
+                "SELECT * FROM decisions WHERE id = ?",
+                (rollout["pending_decision_id"],),
+            ).fetchone()
+            if pending_decision["action"] == ACTION_ROLLBACK:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "a rollback decision is pending execution; config is "
+                        "frozen until its result is recorded"
+                    ),
+                )
+
+        queued = _pending_config_row(conn, rollout_id)
+        latest_version = (
+            queued["version"] if queued else rollout["config_version"]
+        )
+        if req.base_version != latest_version:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"stale config version: latest accepted version is "
+                    f"{latest_version}, request based on {req.base_version}"
+                ),
+            )
+
+        # Unspecified fields inherit from the config the request is based on
+        # (the queued change when there is one, else the effective config).
+        threshold = req.error_rate_threshold
+        if threshold is None:
+            threshold = (
+                queued["error_rate_threshold"]
+                if queued else rollout["error_rate_threshold"]
+            )
+        window = req.min_stable_window_seconds
+        if window is None:
+            window = (
+                queued["min_stable_window_seconds"]
+                if queued else rollout["min_stable_window_seconds"]
+            )
+        new_version = latest_version + 1
+        now = utcnow()
+
+        if pending_decision is not None:
+            # A promote is waiting for its execution result: queue the config
+            # (replacing any previously queued change) until the result lands.
+            conn.execute(
+                """
+                INSERT INTO pending_configs (
+                    rollout_id, version, error_rate_threshold,
+                    min_stable_window_seconds, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(rollout_id) DO UPDATE SET
+                    version = excluded.version,
+                    error_rate_threshold = excluded.error_rate_threshold,
+                    min_stable_window_seconds =
+                        excluded.min_stable_window_seconds,
+                    created_at = excluded.created_at
+                """,
+                (rollout_id, new_version, threshold, window, now),
+            )
+            conn.execute(
+                "UPDATE releases SET updated_at = ? WHERE id = ?",
+                (now, rollout_id),
+            )
+            applied = False
+            message = (
+                f"config v{new_version} stored as pending; it activates when "
+                f"the execution result of decision "
+                f"'{rollout['pending_decision_id']}' is recorded"
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE releases
+                SET error_rate_threshold = ?, min_stable_window_seconds = ?,
+                    config_version = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (threshold, window, new_version, now, rollout_id),
+            )
+            # Defensive: no decision is pending, so nothing may stay queued.
+            conn.execute(
+                "DELETE FROM pending_configs WHERE rollout_id = ?",
+                (rollout_id,),
+            )
+            applied = True
+            message = f"config v{new_version} applied immediately"
+
+        return {
+            "rollout": rollout_view(conn, _get_rollout(conn, rollout_id)),
+            "applied": applied,
+            "message": message,
         }
 
 
@@ -758,7 +944,7 @@ def pause(rollout_id: str, reason: str | None) -> dict:
             (now, decision_id),
         )
         return {
-            "rollout": rollout_view(_get_rollout(conn, rollout_id)),
+            "rollout": rollout_view(conn, _get_rollout(conn, rollout_id)),
             "decision": decision_view(
                 conn.execute(
                     "SELECT * FROM decisions WHERE id = ?", (decision_id,)
@@ -794,4 +980,4 @@ def resume(rollout_id: str) -> dict:
             "updated_at = ? WHERE id = ?",
             (new_status, now, rollout_id),
         )
-        return rollout_view(_get_rollout(conn, rollout_id))
+        return rollout_view(conn, _get_rollout(conn, rollout_id))

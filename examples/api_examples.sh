@@ -3,7 +3,8 @@
 #
 # Scenario: checkout-service, 6 replicas, batch cap 2, 30s minimum stable
 # window, 5% error-rate threshold. The script drives two successful batches,
-# then shows a threshold breach forcing rollback on a second rollout.
+# changes the rollout config mid-flight while a promote is pending, then
+# shows a threshold breach forcing rollback on a second rollout.
 #
 # Usage:
 #   docker compose up -d            # start the API first
@@ -16,6 +17,7 @@ need curl
 need jq
 
 post() { curl -fsS -X POST "$BASE$1" -H 'Content-Type: application/json' -d "$2"; }
+put()  { curl -fsS -X PUT  "$BASE$1" -H 'Content-Type: application/json' -d "$2"; }
 get()  { curl -fsS "$BASE$1"; }
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
@@ -30,11 +32,11 @@ ROLLOUT=$(post /rollouts '{
   "error_rate_threshold": 0.05
 }')
 RID=$(echo "$ROLLOUT" | jq -r .id)
-echo "rollout id: $RID"
+echo "rollout id: $RID (config_version $(echo "$ROLLOUT" | jq .config_version))"
 
 echo
 echo "== 2. first observation with no data -> evaluate holds (pause) =="
-get "/rollouts/$RID" | jq .
+get "/rollouts/$RID" | jq '{status, config_version, pending_config}'
 EVAL=$(post "/rollouts/$RID/evaluate" '{}')
 echo "$EVAL" | jq '{action: .decision.action, reason: .message, status: .rollout.status}'
 
@@ -51,26 +53,44 @@ post "/rollouts/$RID/metrics" "{
   \"error_count\": 4
 }" >/dev/null
 
-echo "== 4. evaluate -> promote 0 -> 2 =="
+echo "== 4. evaluate -> promote 0 -> 2 (decision pending execution) =="
 EVAL=$(post "/rollouts/$RID/evaluate" '{}')
 DID=$(echo "$EVAL" | jq -r .decision.id)
 echo "$EVAL" | jq '{action: .decision.action, from: .decision.from_replicas, to: .decision.to_replicas, reason: .message}'
 
 echo
-echo "== 5. platform reports successful execution; generation advances to 1 =="
-post "/rollouts/$RID/decisions/$DID/result" '{"status":"succeeded","detail":"deployment scaled to 2"}' \
-  | jq '{status: .rollout.status, replicas: .rollout.current_replicas, generation: .rollout.current_generation}'
+echo "== 5. operator loosens the error-rate threshold mid-rollout =="
+echo "-- a promote is pending, so the change is queued as the pending config"
+put "/rollouts/$RID/config" '{"base_version":0,"error_rate_threshold":0.2}' \
+  | jq '{applied, message, effective_threshold: .rollout.error_rate_threshold, pending: .rollout.pending_config}'
 
 echo
-echo "== 6. stale (gen-0) observation after the advance -> recorded but ignored =="
+echo "-- a submission based on the superseded version 0 is rejected (409)"
+curl -s -o /dev/null -w 'stale base_version=0 -> HTTP %{http_code}\n' \
+  -X PUT "$BASE/rollouts/$RID/config" -H 'Content-Type: application/json' \
+  -d '{"base_version":0,"error_rate_threshold":0.9}'
+
+echo
+echo "-- based on the queued v1, a newer change replaces the pending config"
+put "/rollouts/$RID/config" '{"base_version":1,"error_rate_threshold":0.3}' \
+  | jq '{applied, pending: .rollout.pending_config}'
+
+echo
+echo "== 6. platform reports successful execution; pending config activates =="
+post "/rollouts/$RID/decisions/$DID/result" '{"status":"succeeded","detail":"deployment scaled to 2"}' \
+  | jq '{message, status: .rollout.status, replicas: .rollout.current_replicas,
+         generation: .rollout.current_generation,
+         config_version: .rollout.config_version,
+         effective_threshold: .rollout.error_rate_threshold,
+         pending_config: .rollout.pending_config}'
+
+echo
+echo "== 7. stale (gen-0) observation after the advance -> recorded but ignored =="
 post "/rollouts/$RID/replicas" '{"generation":0,"replica_id":"late-canary","state":"ready"}' | jq .
 
 echo
-echo "== 7. gen-1 reports: 2 old + 2 new canaries ready, healthy window =="
-for i in 1 2; do
-  post "/rollouts/$RID/replicas" "{\"generation\":1,\"replica_id\":\"canary-$i\",\"state\":\"ready\",\"observed_version\":\"v2.3.1\"}" >/dev/null
-done
-for i in 3 4; do
+echo "== 8. gen-1 reports: 2 old + 2 new canaries ready, healthy window =="
+for i in 1 2 3 4; do
   post "/rollouts/$RID/replicas" "{\"generation\":1,\"replica_id\":\"canary-$i\",\"state\":\"ready\",\"observed_version\":\"v2.3.1\"}" >/dev/null
 done
 post "/rollouts/$RID/metrics" "{
@@ -86,11 +106,11 @@ echo "$EVAL" | jq '{action: .decision.action, from: .decision.from_replicas, to:
 post "/rollouts/$RID/decisions/$DID/result" '{"status":"succeeded","detail":"scaled to 4"}' >/dev/null
 
 echo
-echo "== 8. decisions recorded so far =="
+echo "== 9. decisions recorded so far =="
 get "/rollouts/$RID/decisions" | jq '.decisions[] | {generation, action, from_replicas, to_replicas, execution_status, reason}'
 
 echo
-echo "== 9. second rollout: error rate breaches threshold -> rollback =="
+echo "== 10. second rollout: error rate breaches threshold -> rollback =="
 RB=$(post /rollouts '{
   "service": "payment-service",
   "target_version": "v9.0.0",
@@ -113,9 +133,21 @@ RDID=$(echo "$EVAL" | jq -r .decision.id)
 echo "$EVAL" | jq '{action: .decision.action, reason: .message, error_rate: .decision.detail.metrics.error_rate}'
 
 echo
-echo "== 10. rollback execution succeeds -> terminal rolled_back =="
+echo "-- config is frozen while a rollback is pending execution (409)"
+curl -s -o /dev/null -w 'config change during pending rollback -> HTTP %{http_code}\n' \
+  -X PUT "$BASE/rollouts/$RBID/config" -H 'Content-Type: application/json' \
+  -d '{"base_version":0,"error_rate_threshold":0.5}'
+
+echo
+echo "== 11. rollback execution succeeds -> terminal rolled_back =="
 post "/rollouts/$RBID/decisions/$RDID/result" '{"status":"succeeded","detail":"traffic shifted to v8"}' \
   | jq '{status: .rollout.status, replicas: .rollout.current_replicas, generation: .rollout.current_generation}'
+
+echo
+echo "-- a terminal rollout rejects further config changes (409)"
+curl -s -o /dev/null -w 'config change after rolled_back -> HTTP %{http_code}\n' \
+  -X PUT "$BASE/rollouts/$RBID/config" -H 'Content-Type: application/json' \
+  -d '{"base_version":0,"error_rate_threshold":0.5}'
 
 echo
 echo "done. inspect stored (including ignored) observations:"

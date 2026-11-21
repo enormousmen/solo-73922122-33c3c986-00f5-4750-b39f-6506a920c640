@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 # ---- release lifecycle states (stored in releases.status) ----
 # pending    : rollout created, no decision yet
@@ -65,6 +65,31 @@ class PauseRequest(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=512)
 
 
+class UpdateConfigRequest(BaseModel):
+    """Operator config change guarded by optimistic versioning.
+
+    ``base_version`` must equal the latest *accepted* config version — the
+    effective one, or the pending one's when a change is already queued
+    behind an in-flight promote. Fields left out inherit from that base.
+    """
+
+    base_version: int = Field(..., ge=0, examples=[0])
+    error_rate_threshold: Optional[float] = Field(default=None, gt=0.0, le=1.0)
+    min_stable_window_seconds: Optional[int] = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _require_at_least_one_field(self) -> "UpdateConfigRequest":
+        if (
+            self.error_rate_threshold is None
+            and self.min_stable_window_seconds is None
+        ):
+            raise ValueError(
+                "provide at least one of error_rate_threshold or "
+                "min_stable_window_seconds"
+            )
+        return self
+
+
 class ObservationAck(BaseModel):
     model_config = ConfigDict(extra="ignore")
     rollout_id: str
@@ -91,6 +116,13 @@ class DecisionView(BaseModel):
     executed_at: Optional[str]
 
 
+class PendingConfigView(BaseModel):
+    version: int
+    error_rate_threshold: float
+    min_stable_window_seconds: int
+    created_at: str
+
+
 class RolloutView(BaseModel):
     id: str
     service: str
@@ -99,6 +131,8 @@ class RolloutView(BaseModel):
     max_replicas_per_batch: int
     min_stable_window_seconds: int
     error_rate_threshold: float
+    config_version: int
+    pending_config: Optional[PendingConfigView] = None
     status: str
     current_generation: int
     current_replicas: int
@@ -113,4 +147,10 @@ class EvaluateResponse(BaseModel):
     rollout: RolloutView
     decision: Optional[DecisionView] = None
     evaluated: bool
+    message: str
+
+
+class ConfigUpdateResponse(BaseModel):
+    rollout: RolloutView
+    applied: bool
     message: str

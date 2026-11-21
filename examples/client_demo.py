@@ -5,8 +5,9 @@ Run the API first (docker compose up -d, or: uvicorn app.main:app), then:
 
     python examples/client_demo.py
 
-The script creates a rollout, drives one healthy batch to a successful
-promote, then feeds a window that breaches the error-rate threshold and
+The script creates a rollout, drives one healthy batch to a pending promote,
+changes the rollout config mid-flight (queued until the execution result
+lands), then feeds a window that breaches the new error-rate threshold and
 follows the resulting rollback decision to its terminal state.
 """
 from __future__ import annotations
@@ -21,7 +22,7 @@ from datetime import datetime, timezone
 BASE = os.environ.get("BASE", "http://127.0.0.1:8000")
 
 
-def call(method: str, path: str, payload: dict | None = None) -> dict:
+def call_raw(method: str, path: str, payload: dict | None = None) -> tuple[int, dict]:
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         BASE + path,
@@ -31,10 +32,16 @@ def call(method: str, path: str, payload: dict | None = None) -> dict:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as exc:  # surface API validation errors
-        body = exc.read().decode()
-        raise SystemExit(f"HTTP {exc.code} on {method} {path}: {body}") from None
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def call(method: str, path: str, payload: dict | None = None) -> dict:
+    status, body = call_raw(method, path, payload)
+    if status >= 400:
+        raise SystemExit(f"HTTP {status} on {method} {path}: {body}")
+    return body
 
 
 def iso_now() -> str:
@@ -52,7 +59,8 @@ def main() -> None:
         "error_rate_threshold": 0.05,
     })
     rid = rollout["id"]
-    print("created", rid, "status:", rollout["status"])
+    print("created", rid, "status:", rollout["status"],
+          "config_version:", rollout["config_version"])
 
     print("\n== healthy canary batch, generation 0 ==")
     call("POST", f"/rollouts/{rid}/replicas", {
@@ -70,6 +78,24 @@ def main() -> None:
     print("decision:", decision["decision"]["action"], "-", decision["message"])
     assert decision["decision"]["action"] == "promote"
 
+    print("\n== operator loosens the threshold to 10% while the promote is pending ==")
+    update = call("PUT", f"/rollouts/{rid}/config", {
+        "base_version": 0, "error_rate_threshold": 0.1,
+    })
+    print("applied:", update["applied"], "-", update["message"])
+    assert update["applied"] is False  # queued behind the pending promote
+    view = call("GET", f"/rollouts/{rid}")
+    print("effective threshold:", view["error_rate_threshold"],
+          "| pending config:", view["pending_config"])
+    assert view["pending_config"]["version"] == 1
+
+    print("\n== a stale submission (base_version 0 again) is rejected ==")
+    status, body = call_raw("PUT", f"/rollouts/{rid}/config", {
+        "base_version": 0, "error_rate_threshold": 0.9,
+    })
+    print("HTTP", status, "-", body["detail"])
+    assert status == 409
+
     print("\n== platform executes the promote successfully ==")
     result = call(
         "POST",
@@ -79,6 +105,10 @@ def main() -> None:
     print("status:", result["rollout"]["status"],
           "replicas:", result["rollout"]["current_replicas"],
           "generation:", result["rollout"]["current_generation"])
+    print("config activated:", result["message"])
+    assert result["rollout"]["config_version"] == 1
+    assert result["rollout"]["error_rate_threshold"] == 0.1
+    assert result["rollout"]["pending_config"] is None
 
     print("\n== late generation-0 report is ignored ==")
     ack = call("POST", f"/rollouts/{rid}/replicas", {
@@ -87,7 +117,7 @@ def main() -> None:
     print("ignored:", ack["ignored"], "-", ack["reason"])
     assert ack["ignored"] is True
 
-    print("\n== generation 1 window breaches the threshold -> rollback ==")
+    print("\n== generation 1 window breaches the new 10% threshold -> rollback ==")
     call("POST", f"/rollouts/{rid}/replicas", {
         "generation": 1, "replica_id": "canary-1",
         "state": "ready", "observed_version": "v2.3.1",
@@ -97,7 +127,7 @@ def main() -> None:
         "window_started_at": iso_now(),
         "window_seconds": 30,
         "request_count": 100,
-        "error_count": 20,  # 20% > 5%
+        "error_count": 20,  # 20% > 10% (new threshold)
     })
     decision = call("POST", f"/rollouts/{rid}/evaluate", {})
     print("decision:", decision["decision"]["action"], "-", decision["message"])
